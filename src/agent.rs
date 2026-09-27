@@ -20,6 +20,7 @@ pub enum Event {
     RequestStarted,
     Text(String),
     ToolCall { name: String, input: Value },
+    ToolResult { name: String, output: tools::Output },
     Usage { usage: Usage, latency: Duration },
     Stopped(StopReason),
     Error(String),
@@ -85,60 +86,66 @@ impl Agent {
                 })
                 .await?;
             let latency = start.elapsed();
-
-            // Blocks that don't match `Block` (e.g. thinking) are skipped here but still echoed below.
-            let mut blocks = Vec::new();
-            for b in &resp.content {
-                if let Ok(block) = Block::deserialize(b) {
-                    blocks.push(block);
-                }
-            }
-
-            for b in &blocks {
-                match b {
-                    Block::Text { text } => {
-                        let _ = events.send(Event::Text(text.clone()));
-                    }
-                    Block::ToolUse { name, input, .. } => {
-                        let _ = events.send(Event::ToolCall {
-                            name: name.clone(),
-                            input: input.clone(),
-                        });
-                    }
-                    _ => {}
-                }
-            }
             let _ = events.send(Event::Usage {
                 usage: resp.usage,
                 latency,
             });
 
+            // Only complete responses enter history. Anything else (cut off at max_tokens,
+            // refused, unknown) is dropped whole: nothing is appended, so there are no
+            // half-finished tool calls to answer and history stays valid.
+            let done = match resp.stop_reason {
+                StopReason::EndTurn => true,
+                StopReason::ToolUse => false,
+                other => {
+                    let _ = events.send(Event::Stopped(other));
+                    return Ok(());
+                }
+            };
+
+            // One pass over the blocks: report each one, and run each tool call as we reach it.
+            // With streaming, this is the code that moves into the `content_block_stop` handler.
+            let mut results = Vec::new();
+            for raw in &resp.content {
+                // Blocks that don't match `Block` (e.g. thinking) are skipped here but still
+                // echoed back in the assistant message below.
+                let Ok(block) = Block::deserialize(raw) else {
+                    continue;
+                };
+                match block {
+                    Block::Text { text } => {
+                        let _ = events.send(Event::Text(text));
+                    }
+                    Block::ToolUse { id, name, input } => {
+                        let _ = events.send(Event::ToolCall {
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+                        let output = tools::run_tool(&name, &input);
+                        results.push(serde_json::to_value(Block::ToolResult {
+                            tool_use_id: id,
+                            content: output.content.clone(),
+                            is_error: output.is_error,
+                        })?);
+                        let _ = events.send(Event::ToolResult { name, output });
+                    }
+                    Block::ToolResult { .. } => {}
+                }
+            }
             self.messages.push(Message {
                 role: Role::Assistant,
                 content: resp.content,
             });
+            if !results.is_empty() {
+                // All results in one user message.
+                self.messages.push(Message {
+                    role: Role::User,
+                    content: results,
+                });
+            }
 
-            match resp.stop_reason {
-                StopReason::EndTurn => return Ok(()),
-                StopReason::ToolUse => {
-                    let mut content = Vec::new();
-                    for b in &blocks {
-                        if let Block::ToolUse { id, name, input } = b {
-                            let result = tools::run_tool(id, name, input);
-                            content.push(serde_json::to_value(result)?);
-                        }
-                    }
-                    // All results in one user message.
-                    self.messages.push(Message {
-                        role: Role::User,
-                        content,
-                    });
-                }
-                other => {
-                    // Don't kill the session; hand control back to the user.
-                    let _ = events.send(Event::Stopped(other));
-                    return Ok(());
-                }
+            if done {
+                return Ok(());
             }
         }
     }

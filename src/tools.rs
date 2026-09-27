@@ -1,7 +1,7 @@
 use anyhow::Context;
 use serde_json::{Value, json};
 
-use crate::api::{Block, Tool};
+use crate::api::Tool;
 
 pub fn definitions() -> Vec<Tool> {
     vec![Tool {
@@ -26,14 +26,21 @@ fn call_tool(name: &str, input: &Value) -> anyhow::Result<String> {
     }
 }
 
-pub fn run_tool(id: &str, name: &str, input: &Value) -> Block {
-    let (content, is_error) = match call_tool(name, input) {
-        Ok(s) => (s, false),
-        Err(e) => (e.to_string(), true),
-    };
-    Block::ToolResult {
-        tool_use_id: id.to_string(),
-        content,
-        is_error,
+pub struct Output {
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// Runs a tool. Failures become error output for the model rather than aborting the turn.
+pub fn run_tool(name: &str, input: &Value) -> Output {
+    match call_tool(name, input) {
+        Ok(content) => Output {
+            content,
+            is_error: false,
+        },
+        Err(e) => Output {
+            content: e.to_string(),
+            is_error: true,
+        },
     }
 }

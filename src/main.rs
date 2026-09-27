@@ -23,11 +23,6 @@ const CLEAR_LINE: &str = "\r\x1b[2K";
 const PROGRESS_BUSY: &str = "\x1b]9;4;3\x07"; // indeterminate
 const PROGRESS_CLEAR: &str = "\x1b]9;4;0\x07";
 
-fn prompt() -> std::io::Result<()> {
-    print!("> ");
-    std::io::stdout().flush()
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = cli::parse_args()?;
@@ -65,7 +60,8 @@ async fn main() -> anyhow::Result<()> {
 
     // One turn at a time: read a line, then render the turn's events until it ends.
     'session: loop {
-        prompt()?;
+        print!("> ");
+        std::io::stdout().flush()?;
         let line = tokio::select! {
             line = line_rx.recv() => match line {
                 Some(line) => line,
@@ -102,6 +98,13 @@ async fn main() -> anyhow::Result<()> {
                         Event::Text(text) => println!("{text}\n"),
                         Event::ToolCall { name, input } => {
                             eprintln!("{DIM}→ {name}({input}){RESET}");
+                        }
+                        Event::ToolResult { name, output } => {
+                            if output.is_error {
+                                eprintln!("{DIM}  ✗ {name}: {}{RESET}", output.content);
+                            } else {
+                                eprintln!("{DIM}  ✓ {name}: {} lines{RESET}", output.content.lines().count());
+                            }
                         }
                         Event::Usage { usage: u, latency } => eprintln!(
                             "{DIM}[tokens: {} in / {} cache write / {} cache read / {} out | {:.1}s]{RESET}",

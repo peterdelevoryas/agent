@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Event::ToolResult { name, output } => {
                             if output.is_error {
-                                eprintln!("{DIM}  ✗ {name}: {}{RESET}", output.content);
+                                eprintln!("{DIM}  ✗ {name}: {}{RESET}", one_line(&output.content, 120));
                             } else {
                                 eprintln!("{DIM}  ✓ {name}: {} lines{RESET}", output.content.lines().count());
                             }

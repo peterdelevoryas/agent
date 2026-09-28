@@ -20,6 +20,9 @@ const BASH_PIPE_HEAD_BYTES: usize = 2_000;
 const BASH_PIPE_TAIL_BYTES: usize = 12_000;
 // How long a timed-out or interrupted command gets to exit after SIGTERM before SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(2);
+// How long to keep reading the pipes after the process group is killed. Anything still holding
+// them open by then escaped the group (setsid, daemons) and would otherwise hang us forever.
+const PIPE_GRACE: Duration = Duration::from_secs(1);
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 const MAX_BASH_TIMEOUT_SECS: u64 = 600;
 
@@ -74,7 +77,7 @@ pub fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "bash".into(),
-            description: "Run a command with `bash -c` in the working directory and return its exit status, stdout, and stderr. No stdin; interactive commands will not work. If the command times out or the user interrupts it, it is terminated and you get the output it produced so far. Background processes it starts are killed when it finishes. Long output keeps its start and end, with the middle cut.".into(),
+            description: "Run a command with `bash -c` in the working directory and return its exit status, stdout, and stderr. No stdin; interactive commands will not work. If the command times out or the user interrupts it, it is terminated and you get the output it produced so far. Background processes it starts are killed when it finishes, unless they detach into their own session. Long output keeps its start and end, with the middle cut.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -98,16 +101,18 @@ async fn call_tool(
     match name {
         "read_file" => {
             let path = input["path"].as_str().context("missing `path`")?;
-            let contents = std::fs::read_to_string(path)?;
+            let contents =
+                std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
             Ok(contents)
         }
         "list_dir" => {
             let path = input["path"].as_str().context("missing `path`")?;
+            let listing_err = || format!("listing {path}");
             let mut names = Vec::new();
-            for entry in std::fs::read_dir(path)? {
-                let entry = entry?;
+            for entry in std::fs::read_dir(path).with_context(listing_err)? {
+                let entry = entry.with_context(listing_err)?;
                 let mut name = entry.file_name().to_string_lossy().into_owned();
-                if entry.file_type()?.is_dir() {
+                if entry.file_type().with_context(listing_err)?.is_dir() {
                     name.push('/');
                 }
                 names.push(name);
@@ -119,9 +124,10 @@ async fn call_tool(
             let path = input["path"].as_str().context("missing `path`")?;
             let content = input["content"].as_str().context("missing `content`")?;
             if let Some(parent) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
             }
-            std::fs::write(path, content)?;
+            std::fs::write(path, content).with_context(|| format!("writing {path}"))?;
             Ok(format!("Wrote {} bytes to {path}.", content.len()))
         }
         "edit_file" => {
@@ -132,7 +138,8 @@ async fn call_tool(
             let new = input["new_string"]
                 .as_str()
                 .context("missing `new_string`")?;
-            let contents = std::fs::read_to_string(path)?;
+            let contents =
+                std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
             let count = contents.matches(old).count();
             if count == 0 {
                 anyhow::bail!("`old_string` not found in {path}");
@@ -142,7 +149,8 @@ async fn call_tool(
                     "`old_string` appears {count} times in {path}; include more surrounding lines to make it unique"
                 );
             }
-            std::fs::write(path, contents.replacen(old, new, 1))?;
+            std::fs::write(path, contents.replacen(old, new, 1))
+                .with_context(|| format!("writing {path}"))?;
             Ok(format!("Edited {path}."))
         }
         "bash" => {
@@ -167,7 +175,9 @@ pub struct Output {
 pub async fn run_tool(name: &str, input: &Value, cancel: oneshot::Receiver<()>) -> Output {
     let (content, is_error) = match call_tool(name, input, cancel).await {
         Ok(content) => (content, false),
-        Err(e) => (e.to_string(), true),
+        // `:#` includes the cause chain ("reading x: No such file or directory"), not just
+        // the outermost context.
+        Err(e) => (format!("{e:#}"), true),
     };
     Output {
         content: truncate(&content, MAX_OUTPUT_HEAD_BYTES, MAX_OUTPUT_TAIL_BYTES),
@@ -201,8 +211,16 @@ async fn run_bash(
     let pgid = child.id().context("bash exited before we got its pid")? as i32;
 
     // Read both pipes as the command runs, so partial output survives however it ends.
-    let stdout = tokio::spawn(capture(child.stdout.take().context("no stdout")?));
-    let stderr = tokio::spawn(capture(child.stderr.take().context("no stderr")?));
+    let (stop_stdout, stop_stdout_rx) = oneshot::channel();
+    let (stop_stderr, stop_stderr_rx) = oneshot::channel();
+    let stdout = tokio::spawn(capture(
+        child.stdout.take().context("no stdout")?,
+        stop_stdout_rx,
+    ));
+    let stderr = tokio::spawn(capture(
+        child.stderr.take().context("no stderr")?,
+        stop_stderr_rx,
+    ));
 
     let end = tokio::select! {
         status = child.wait() => End::Exited(status?),
@@ -227,8 +245,20 @@ async fn run_bash(
     // and the pipes close. (The group can already be empty; that's fine.)
     killpg(pgid, libc::SIGKILL);
 
-    let stdout = stdout.await?;
-    let stderr = stderr.await?;
+    // Normally the pipes hit EOF right away. If something outside the group still holds
+    // them, tell the readers to stop after a grace period and keep what they have.
+    // Timing out on `&mut joined` leaves the future intact, so we can keep awaiting it.
+    let joined = async { (stdout.await, stderr.await) };
+    tokio::pin!(joined);
+    let (stdout, stderr) = match tokio::time::timeout(PIPE_GRACE, &mut joined).await {
+        Ok(done) => done,
+        Err(_) => {
+            let _ = stop_stdout.send(());
+            let _ = stop_stderr.send(());
+            joined.await
+        }
+    };
+    let (stdout, stderr) = (stdout?, stderr?);
     let mut text = String::new();
     if let Some(why) = &why {
         text.push_str(&format!("[{why}; partial output below]\n"));
@@ -281,6 +311,8 @@ struct Capture {
     head: Vec<u8>,
     tail: Vec<u8>,
     total: usize,
+    /// Reading stopped before EOF: a process outside the group still had the pipe open.
+    abandoned: bool,
 }
 
 impl Capture {
@@ -291,19 +323,34 @@ impl Capture {
             text.push_str(&format!("\n[… {dropped} bytes cut …]\n"));
         }
         text.push_str(&String::from_utf8_lossy(&self.tail));
+        if self.abandoned {
+            text.push_str(
+                "\n[stopped reading: a process that left the command's process group (setsid, daemon) still has this pipe open and may still be running]\n",
+            );
+        }
         text
     }
 }
 
-async fn capture(mut pipe: impl AsyncRead + Unpin) -> Capture {
+/// Reads `pipe` to EOF, or until `stop` fires.
+async fn capture(mut pipe: impl AsyncRead + Unpin, mut stop: oneshot::Receiver<()>) -> Capture {
     let mut capture = Capture {
         head: Vec::new(),
         tail: Vec::new(),
         total: 0,
+        abandoned: false,
     };
     let mut chunk = [0u8; 8192];
     loop {
-        let n = match pipe.read(&mut chunk).await {
+        let read = tokio::select! {
+            read = pipe.read(&mut chunk) => read,
+            // A dropped sender doesn't match, which disables this branch: keep reading.
+            Ok(()) = &mut stop => {
+                capture.abandoned = true;
+                break;
+            }
+        };
+        let n = match read {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
@@ -351,4 +398,70 @@ fn truncate(s: &str, head: usize, tail: usize) -> String {
         s.len(),
         &s[tail_start..]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_cancel() -> oneshot::Receiver<()> {
+        // Keep the sender alive for the test's duration by leaking it; a dropped sender
+        // would be fine too, but this mirrors how the agent calls us.
+        let (tx, rx) = oneshot::channel();
+        std::mem::forget(tx);
+        rx
+    }
+
+    #[tokio::test]
+    async fn bash_returns_output() {
+        let out = run_bash(
+            "echo hi; echo err >&2",
+            Duration::from_secs(10),
+            no_cancel(),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("exit code: 0"), "{out}");
+        assert!(out.contains("stdout:\nhi\n"), "{out}");
+        assert!(out.contains("stderr:\nerr\n"), "{out}");
+        assert!(!out.contains("stopped reading"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn bash_does_not_hang_on_escaped_process() {
+        // The background perl leaves the process group via setsid, so killpg can't reach it,
+        // and it inherits stdout, so the pipe never closes on its own.
+        let start = Instant::now();
+        let out = run_bash(
+            "perl -e 'use POSIX; setsid(); sleep 10' & sleep 0.5; echo started",
+            Duration::from_secs(30),
+            no_cancel(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert!(out.contains("started"), "{out}");
+        assert!(out.contains("stopped reading"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn file_errors_name_the_path() {
+        let out = run_tool(
+            "read_file",
+            &json!({ "path": "/nonexistent/nope.txt" }),
+            no_cancel(),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("/nonexistent/nope.txt"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("No such file"), "{}", out.content);
+    }
 }

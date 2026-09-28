@@ -9,10 +9,14 @@ use crate::tools;
 
 const MAX_TOKENS: u32 = 16000;
 const SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
+const INTERRUPTED: &str = "Interrupted by the user before this finished.";
+const INTERRUPTED_BEFORE_RESPONSE: &str = "[The user interrupted this turn before you responded. Don't act on the messages above unless asked again.]";
 
 /// What front ends send to the agent.
 pub enum Input {
     Message(String),
+    /// Stop the current turn. Ignored between turns.
+    Interrupt,
 }
 
 /// What the agent reports back. Front ends decide how (or whether) to show each one.
@@ -23,6 +27,7 @@ pub enum Event {
     ToolResult { name: String, output: tools::Output },
     Usage { usage: Usage, latency: Duration },
     Stopped(StopReason),
+    Interrupted,
     Error(String),
     TurnEnded,
 }
@@ -57,12 +62,16 @@ impl Agent {
         mut inputs: mpsc::UnboundedReceiver<Input>,
         events: mpsc::UnboundedSender<Event>,
     ) {
-        while let Some(Input::Message(text)) = inputs.recv().await {
+        while let Some(input) = inputs.recv().await {
+            // An interrupt that arrives after its turn already ended lands here; drop it.
+            let Input::Message(text) = input else {
+                continue;
+            };
             self.messages.push(Message {
                 role: Role::User,
                 content: vec![json!({ "type": "text", "text": text })],
             });
-            if let Err(e) = self.run_turn(&events).await {
+            if let Err(e) = self.run_turn(&mut inputs, &events).await {
                 let _ = events.send(Event::Error(format!("{e:#}")));
             }
             let _ = events.send(Event::TurnEnded);
@@ -70,21 +79,38 @@ impl Agent {
     }
 
     /// Keeps calling the model until it stops asking for tools.
-    async fn run_turn(&mut self, events: &mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
+    /// An interrupt drops whatever is in flight.
+    async fn run_turn(
+        &mut self,
+        inputs: &mut mpsc::UnboundedReceiver<Input>,
+        events: &mpsc::UnboundedSender<Event>,
+    ) -> anyhow::Result<()> {
         loop {
             let _ = events.send(Event::RequestStarted);
             let start = Instant::now();
-            let resp = self
-                .client
-                .send(&Request {
-                    model: &self.model,
-                    max_tokens: MAX_TOKENS,
-                    system: &self.system,
-                    tools: &self.tools,
-                    messages: &self.messages,
-                    cache_control: CacheControl::Ephemeral,
-                })
-                .await?;
+            let req = Request {
+                model: &self.model,
+                max_tokens: MAX_TOKENS,
+                system: &self.system,
+                tools: &self.tools,
+                messages: &self.messages,
+                cache_control: CacheControl::Ephemeral,
+            };
+            let resp = tokio::select! {
+                resp = self.client.send(&req) => resp?,
+                // Nothing has been appended for this request yet, so dropping it leaves
+                // history valid.
+                _ = wait_for_interrupt(inputs) => {
+                    // Record it, so the model doesn't treat the unanswered message as still
+                    // open. Appended as a user message; the API merges consecutive ones.
+                    self.messages.push(Message {
+                        role: Role::User,
+                        content: vec![json!({ "type": "text", "text": INTERRUPTED_BEFORE_RESPONSE })],
+                    });
+                    let _ = events.send(Event::Interrupted);
+                    return Ok(());
+                }
+            };
             let latency = start.elapsed();
             let _ = events.send(Event::Usage {
                 usage: resp.usage,
@@ -106,6 +132,7 @@ impl Agent {
             // One pass over the blocks: report each one, and run each tool call as we reach it.
             // With streaming, this is the code that moves into the `content_block_stop` handler.
             let mut results = Vec::new();
+            let mut interrupted = false;
             for raw in &resp.content {
                 // Blocks that don't match `Block` (e.g. thinking) are skipped here but still
                 // echoed back in the assistant message below.
@@ -121,7 +148,19 @@ impl Agent {
                             name: name.clone(),
                             input: input.clone(),
                         });
-                        let output = tools::run_tool(&name, &input).await;
+                        // After an interrupt, the remaining calls still need a result each.
+                        let output = if interrupted {
+                            interrupted_output()
+                        } else {
+                            tokio::select! {
+                                output = tools::run_tool(&name, &input) => output,
+                                // Dropping the tool's future kills a running bash command.
+                                _ = wait_for_interrupt(inputs) => {
+                                    interrupted = true;
+                                    interrupted_output()
+                                }
+                            }
+                        };
                         results.push(serde_json::to_value(Block::ToolResult {
                             tool_use_id: id,
                             content: output.content.clone(),
@@ -144,9 +183,33 @@ impl Agent {
                 });
             }
 
+            if interrupted {
+                let _ = events.send(Event::Interrupted);
+                return Ok(());
+            }
             if done {
                 return Ok(());
             }
         }
+    }
+}
+
+/// Resolves when the front end asks to interrupt the current turn.
+async fn wait_for_interrupt(inputs: &mut mpsc::UnboundedReceiver<Input>) {
+    loop {
+        match inputs.recv().await {
+            Some(Input::Interrupt) => return,
+            // The terminal front end only sends messages between turns.
+            Some(Input::Message(_)) => {}
+            // Front end gone: never interrupt, let the turn finish.
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+fn interrupted_output() -> tools::Output {
+    tools::Output {
+        content: INTERRUPTED.to_string(),
+        is_error: true,
     }
 }

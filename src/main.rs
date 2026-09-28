@@ -6,6 +6,7 @@ mod tools;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -67,9 +68,8 @@ async fn main() -> anyhow::Result<()> {
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut waiting_since: Option<Instant> = None;
 
-    // Resolves on the first ctrl-c. Pinned once, outside the loop, so it's a single listener.
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    // ctrl-c during a turn interrupts it; at the prompt, or a second time, it quits.
+    let mut ctrl_c = signal(SignalKind::interrupt())?;
 
     // One turn at a time: read a line, then render the turn's events until it ends.
     'session: loop {
@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(line) => line,
                 None => break 'session, // EOF (ctrl-d)
             },
-            _ = &mut ctrl_c => break 'session,
+            _ = ctrl_c.recv() => break 'session,
         };
         let line = line.trim();
         if line.is_empty() {
@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
             break 'session;
         }
 
+        let mut interrupting = false;
         loop {
             tokio::select! {
                 event = event_rx.recv() => {
@@ -128,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
                             latency.as_secs_f64()
                         ),
                         Event::Stopped(reason) => eprintln!("[stopped: {reason:?}]"),
+                        Event::Interrupted => eprintln!("{DIM}[interrupted]{RESET}"),
                         Event::Error(e) => eprintln!("error: {e}"),
                         Event::TurnEnded => {
                             println!();
@@ -140,7 +142,12 @@ async fn main() -> anyhow::Result<()> {
                         eprint!("{CLEAR_LINE}{DIM}{:.2}s{RESET}", start.elapsed().as_secs_f64());
                     }
                 }
-                _ = &mut ctrl_c => break 'session,
+                _ = ctrl_c.recv() => {
+                    if interrupting || input_tx.send(Input::Interrupt).is_err() {
+                        break 'session;
+                    }
+                    interrupting = true;
+                }
             }
         }
     }

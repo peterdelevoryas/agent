@@ -23,6 +23,19 @@ const CLEAR_LINE: &str = "\r\x1b[2K";
 const PROGRESS_BUSY: &str = "\x1b]9;4;3\x07"; // indeterminate
 const PROGRESS_CLEAR: &str = "\x1b]9;4;0\x07";
 
+/// Shortens `s` to at most `max` characters for a one-line display.
+fn one_line(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i == max {
+            out.push('…');
+            break;
+        }
+        out.push(if c == '\n' { ' ' } else { c });
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = cli::parse_args()?;
@@ -97,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Event::Text(text) => println!("{text}\n"),
                         Event::ToolCall { name, input } => {
-                            eprintln!("{DIM}→ {name}({input}){RESET}");
+                            eprintln!("{DIM}→ {name}({}){RESET}", one_line(&input.to_string(), 120));
                         }
                         Event::ToolResult { name, output } => {
                             if output.is_error {

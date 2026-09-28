@@ -121,7 +121,7 @@ impl Agent {
                             name: name.clone(),
                             input: input.clone(),
                         });
-                        let output = tools::run_tool(&name, &input);
+                        let output = tools::run_tool(&name, &input).await;
                         results.push(serde_json::to_value(Block::ToolResult {
                             tool_use_id: id,
                             content: output.content.clone(),

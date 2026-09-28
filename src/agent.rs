@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::api::{Block, CacheControl, Client, Message, Request, Role, StopReason, Tool, Usage};
 use crate::tools;
@@ -152,12 +152,19 @@ impl Agent {
                         let output = if interrupted {
                             interrupted_output()
                         } else {
+                            let (cancel, cancel_rx) = oneshot::channel();
+                            let run = tools::run_tool(&name, &input, cancel_rx);
+                            tokio::pin!(run);
                             tokio::select! {
-                                output = tools::run_tool(&name, &input) => output,
-                                // Dropping the tool's future kills a running bash command.
+                                // If both are ready, keep the tool's real result.
+                                biased;
+                                output = &mut run => output,
                                 _ = wait_for_interrupt(inputs) => {
                                     interrupted = true;
-                                    interrupted_output()
+                                    // Ask the tool to stop, then wait for it to report how
+                                    // far it got (bash returns its partial output).
+                                    let _ = cancel.send(());
+                                    run.await
                                 }
                             }
                         };

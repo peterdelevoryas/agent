@@ -1,13 +1,25 @@
-use std::process::Stdio;
-use std::time::Duration;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Child;
+use tokio::sync::oneshot;
 
 use crate::api::Tool;
 
-// Longest tool output sent back to the model, so one big file or command can't flood the context.
-const MAX_OUTPUT_BYTES: usize = 30_000;
+// Longest tool output sent back to the model, so one big file or command can't flood the context:
+// the first and last bytes are kept.
+const MAX_OUTPUT_HEAD_BYTES: usize = 5_000;
+const MAX_OUTPUT_TAIL_BYTES: usize = 25_000;
+// Per pipe, for bash. Both pipes together stay under the overall limit above, so bash output
+// is only ever cut once, here, and the note shows the real byte count.
+const BASH_PIPE_HEAD_BYTES: usize = 2_000;
+const BASH_PIPE_TAIL_BYTES: usize = 12_000;
+// How long a timed-out or interrupted command gets to exit after SIGTERM before SIGKILL.
+const TERM_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 const MAX_BASH_TIMEOUT_SECS: u64 = 600;
 
@@ -62,7 +74,7 @@ pub fn definitions() -> Vec<Tool> {
         },
         Tool {
             name: "bash".into(),
-            description: "Run a command with `bash -c` in the working directory and return its exit code, stdout, and stderr. No stdin; interactive commands will not work.".into(),
+            description: "Run a command with `bash -c` in the working directory and return its exit status, stdout, and stderr. No stdin; interactive commands will not work. If the command times out or the user interrupts it, it is terminated and you get the output it produced so far. Background processes it starts are killed when it finishes. Long output keeps its start and end, with the middle cut.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -78,7 +90,11 @@ pub fn definitions() -> Vec<Tool> {
     ]
 }
 
-async fn call_tool(name: &str, input: &Value) -> anyhow::Result<String> {
+async fn call_tool(
+    name: &str,
+    input: &Value,
+    cancel: oneshot::Receiver<()>,
+) -> anyhow::Result<String> {
     match name {
         "read_file" => {
             let path = input["path"].as_str().context("missing `path`")?;
@@ -135,31 +151,7 @@ async fn call_tool(name: &str, input: &Value) -> anyhow::Result<String> {
                 .as_u64()
                 .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
             let timeout = Duration::from_secs(timeout_secs.min(MAX_BASH_TIMEOUT_SECS));
-
-            let child = tokio::process::Command::new("bash")
-                .arg("-c")
-                .arg(command)
-                .stdin(Stdio::null())
-                .kill_on_drop(true) // so a timeout actually kills it
-                .output();
-            let Ok(output) = tokio::time::timeout(timeout, child).await else {
-                anyhow::bail!("timed out after {}s", timeout.as_secs());
-            };
-            let output = output?;
-
-            let code = match output.status.code() {
-                Some(code) => code.to_string(),
-                None => "none (killed by a signal)".to_string(),
-            };
-            let text = format!(
-                "exit code: {code}\n\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            if !output.status.success() {
-                anyhow::bail!(text);
-            }
-            Ok(text)
+            run_bash(command, timeout, cancel).await
         }
         _ => anyhow::bail!("unknown tool: {name}"),
     }
@@ -171,29 +163,192 @@ pub struct Output {
 }
 
 /// Runs a tool. Failures become error output for the model rather than aborting the turn.
-pub async fn run_tool(name: &str, input: &Value) -> Output {
-    let (content, is_error) = match call_tool(name, input).await {
+/// Sending on `cancel` asks a long-running tool (bash) to stop and report what it has so far.
+pub async fn run_tool(name: &str, input: &Value, cancel: oneshot::Receiver<()>) -> Output {
+    let (content, is_error) = match call_tool(name, input, cancel).await {
         Ok(content) => (content, false),
         Err(e) => (e.to_string(), true),
     };
     Output {
-        content: truncate(content),
+        content: truncate(&content, MAX_OUTPUT_HEAD_BYTES, MAX_OUTPUT_TAIL_BYTES),
         is_error,
     }
 }
 
-fn truncate(mut s: String) -> String {
-    if s.len() <= MAX_OUTPUT_BYTES {
-        return s;
+enum End {
+    Exited(ExitStatus),
+    TimedOut,
+    Interrupted,
+}
+
+async fn run_bash(
+    command: &str,
+    timeout: Duration,
+    mut cancel: oneshot::Receiver<()>,
+) -> anyhow::Result<String> {
+    let start = Instant::now();
+    let mut child = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own process group: the terminal's ctrl-c doesn't reach it (the agent decides
+        // what an interrupt does), and killpg reaches everything it started.
+        .process_group(0)
+        .kill_on_drop(true) // safety net only
+        .spawn()?;
+    let pgid = child.id().context("bash exited before we got its pid")? as i32;
+
+    // Read both pipes as the command runs, so partial output survives however it ends.
+    let stdout = tokio::spawn(capture(child.stdout.take().context("no stdout")?));
+    let stderr = tokio::spawn(capture(child.stderr.take().context("no stderr")?));
+
+    let end = tokio::select! {
+        status = child.wait() => End::Exited(status?),
+        _ = tokio::time::sleep(timeout) => End::TimedOut,
+        Ok(()) = &mut cancel => End::Interrupted,
+    };
+    let (status, why) = match end {
+        End::Exited(status) => (status, None),
+        End::TimedOut => (
+            terminate(&mut child, pgid).await?,
+            Some(format!("timed out after {}s", timeout.as_secs())),
+        ),
+        End::Interrupted => (
+            terminate(&mut child, pgid).await?,
+            Some(format!(
+                "interrupted by the user after {:.1}s",
+                start.elapsed().as_secs_f64()
+            )),
+        ),
+    };
+    // Kill anything it left running in the background, so nothing outlives the command
+    // and the pipes close. (The group can already be empty; that's fine.)
+    killpg(pgid, libc::SIGKILL);
+
+    let stdout = stdout.await?;
+    let stderr = stderr.await?;
+    let mut text = String::new();
+    if let Some(why) = &why {
+        text.push_str(&format!("[{why}; partial output below]\n"));
     }
-    let total = s.len();
-    let mut end = MAX_OUTPUT_BYTES;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.truncate(end);
-    s.push_str(&format!(
-        "\n\n[truncated: showing the first {end} of {total} bytes]"
+    text.push_str(&format!(
+        "{}\n\nstdout:\n{}\nstderr:\n{}",
+        describe(status),
+        stdout.render(),
+        stderr.render()
     ));
-    s
+    if why.is_some() || !status.success() {
+        anyhow::bail!(text);
+    }
+    Ok(text)
+}
+
+/// SIGTERM the whole group, give it a moment, then SIGKILL. Returns bash's exit status.
+async fn terminate(child: &mut Child, pgid: i32) -> std::io::Result<ExitStatus> {
+    killpg(pgid, libc::SIGTERM);
+    if let Ok(status) = tokio::time::timeout(TERM_GRACE, child.wait()).await {
+        return status;
+    }
+    killpg(pgid, libc::SIGKILL);
+    child.wait().await
+}
+
+fn killpg(pgid: i32, signal: i32) {
+    // Safety: killpg only sends a signal; the worst case is ESRCH when the group is gone.
+    unsafe {
+        libc::killpg(pgid, signal);
+    }
+}
+
+fn describe(status: ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit code: {code}");
+    }
+    match status.signal() {
+        Some(libc::SIGINT) => "killed by SIGINT".to_string(),
+        Some(libc::SIGTERM) => "killed by SIGTERM".to_string(),
+        Some(libc::SIGKILL) => "killed by SIGKILL".to_string(),
+        Some(signal) => format!("killed by signal {signal}"),
+        None => "exit status unknown".to_string(),
+    }
+}
+
+/// What a command wrote to one pipe: the first and last bytes, with the middle dropped
+/// so a runaway command can't use unbounded memory.
+struct Capture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    total: usize,
+}
+
+impl Capture {
+    fn render(&self) -> String {
+        let dropped = self.total - self.head.len() - self.tail.len();
+        let mut text = String::from_utf8_lossy(&self.head).into_owned();
+        if dropped > 0 {
+            text.push_str(&format!("\n[… {dropped} bytes cut …]\n"));
+        }
+        text.push_str(&String::from_utf8_lossy(&self.tail));
+        text
+    }
+}
+
+async fn capture(mut pipe: impl AsyncRead + Unpin) -> Capture {
+    let mut capture = Capture {
+        head: Vec::new(),
+        tail: Vec::new(),
+        total: 0,
+    };
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        capture.total += n;
+        let mut bytes = &chunk[..n];
+        let room = BASH_PIPE_HEAD_BYTES - capture.head.len();
+        if room > 0 {
+            let take = room.min(bytes.len());
+            capture.head.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        capture.tail.extend_from_slice(bytes);
+        // Let the tail grow to twice its limit before trimming, so we don't shift it on every read.
+        if capture.tail.len() > 2 * BASH_PIPE_TAIL_BYTES {
+            let excess = capture.tail.len() - BASH_PIPE_TAIL_BYTES;
+            capture.tail.drain(..excess);
+        }
+    }
+    if capture.tail.len() > BASH_PIPE_TAIL_BYTES {
+        let excess = capture.tail.len() - BASH_PIPE_TAIL_BYTES;
+        capture.tail.drain(..excess);
+    }
+    capture
+}
+
+///
+/// Keeps the first `head` and last `tail` bytes of `s`, with a note about what was cut.
+/// The start often has the first error; the end has where things stopped.
+fn truncate(s: &str, head: usize, tail: usize) -> String {
+    if s.len() <= head + tail {
+        return s.to_string();
+    }
+    let mut head_end = head;
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - tail;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n\n[… {} of {} bytes cut …]\n\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        s.len(),
+        &s[tail_start..]
+    )
 }

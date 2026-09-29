@@ -27,6 +27,8 @@ users:
   - name: agent
     system: true
     shell: /usr/sbin/nologin
+    # On the volume (created by deploy.sh), so its keys and git config persist.
+    homedir: /var/lib/agent/home
     no_create_home: true
 mounts:
   - [LABEL=agent-data, /var/lib/agent, ext4, "defaults,nofail,discard", "0", "2"]

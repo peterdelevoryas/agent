@@ -51,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
                 tracing_subscriber::EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| "agent=info".into()),
             )
+            // Under systemd, stdout is the journal: color codes would show up raw.
+            .with_ansi(std::io::stdout().is_terminal())
             .init();
         return serve::run(args.model).await;
     }

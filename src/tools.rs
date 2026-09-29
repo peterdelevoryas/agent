@@ -170,6 +170,14 @@ pub struct Output {
     pub is_error: bool,
 }
 
+/// Tool output for the model, with long output cut the same way for every tool.
+pub fn output(content: &str, is_error: bool) -> Output {
+    Output {
+        content: truncate(content, MAX_OUTPUT_HEAD_BYTES, MAX_OUTPUT_TAIL_BYTES),
+        is_error,
+    }
+}
+
 /// Runs a tool. Failures become error output for the model rather than aborting the turn.
 /// Sending on `cancel` asks a long-running tool (bash) to stop and report what it has so far.
 pub async fn run_tool(name: &str, input: &Value, cancel: oneshot::Receiver<()>) -> Output {
@@ -179,10 +187,7 @@ pub async fn run_tool(name: &str, input: &Value, cancel: oneshot::Receiver<()>) 
         // the outermost context.
         Err(e) => (format!("{e:#}"), true),
     };
-    Output {
-        content: truncate(&content, MAX_OUTPUT_HEAD_BYTES, MAX_OUTPUT_TAIL_BYTES),
-        is_error,
-    }
+    output(&content, is_error)
 }
 
 enum End {

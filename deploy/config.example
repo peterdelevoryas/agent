@@ -1,0 +1,10 @@
+# Copy to deploy/config (untracked). The agent has no public hostname: set the
+# server's public IP for SSH, and its private-network IP, where /input listens.
+AGENT_HOST=root@203.0.113.10
+AGENT_PRIVATE_IP=10.0.0.3
+# MCP servers the agent connects to, name=url; each token is read from the
+# macOS keychain (service <name>-mcp-token, account agent) by secrets.sh.
+AGENT_MCP_SERVERS=memory=https://memory.example.com/mcp
+# Relays the agent catches up with (GET <url>/inbox), name=url; the name is
+# the relay's channel, and its token is the same one as its MCP server's.
+AGENT_RELAYS=whatsapp=https://whatsapp.example.com

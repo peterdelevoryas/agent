@@ -1,0 +1,6 @@
+[Unit]
+Description=Back up the agent database to another machine
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agent-backup

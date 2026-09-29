@@ -1,0 +1,33 @@
+[Unit]
+Description=Agent
+# The conversation and the agent's working directory live on a block-storage
+# volume mounted here.
+RequiresMountsFor=/var/lib/agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agent
+Group=agent
+Environment=AGENT_DB=/var/lib/agent/agent.db
+Environment=AGENT_BACKUP_STAMP=/var/lib/agent/last-backup
+# Only on the private network, where the relays are.
+Environment=AGENT_ADDR=@PRIVATE_IP@:8770
+Environment=HOME=/var/lib/agent/home
+# ANTHROPIC_API_KEY, AGENT_INPUT_TOKEN, and the MCP servers; written by deploy/secrets.sh.
+EnvironmentFile=/etc/agent/env
+# Never start on an empty directory if the volume failed to mount.
+ExecStartPre=/usr/bin/mountpoint -q /var/lib/agent
+# Where the agent's bash runs.
+WorkingDirectory=/var/lib/agent/work
+ExecStart=/usr/local/bin/agent serve
+Restart=on-failure
+StateDirectory=agent
+StateDirectoryMode=0700
+
+# No sandboxing: the agent has full sudo on this VM (see cloud-init.yaml), so
+# restrictions here would only get in its way, and NoNewPrivileges would block
+# sudo outright. The VM itself is the boundary.
+
+[Install]
+WantedBy=multi-user.target

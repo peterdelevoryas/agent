@@ -1,6 +1,10 @@
 mod agent;
 mod api;
 mod cli;
+mod health;
+mod mcp;
+mod serve;
+mod store;
 mod tools;
 
 use std::io::{IsTerminal, Write};
@@ -12,6 +16,7 @@ use tokio::time::MissedTickBehavior;
 
 use agent::{Agent, Event, Input};
 use api::Client;
+use mcp::Mcp;
 
 // ANSI escapes for de-emphasizing status lines (tool calls, token counts).
 const DIM: &str = "\x1b[2m";
@@ -40,7 +45,24 @@ fn one_line(s: &str, max: usize) -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = cli::parse_args()?;
-    let agent = Agent::new(Client::from_env()?, args.model)?;
+    if args.serve {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "agent=info".into()),
+            )
+            .init();
+        return serve::run(args.model).await;
+    }
+    // The terminal starts a fresh conversation each time; only serve mode saves one.
+    let agent = Agent::new(
+        Client::from_env()?,
+        args.model,
+        "",
+        Mcp::from_env().await?,
+        None,
+    )
+    .await?;
 
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -67,6 +89,8 @@ async fn main() -> anyhow::Result<()> {
     // stretch fires every missed tick at once.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut waiting_since: Option<Instant> = None;
+    // True while streamed text has left the cursor mid-line.
+    let mut mid_line = false;
 
     // ctrl-c during a turn interrupts it; at the prompt, or a second time, it quits.
     let mut ctrl_c = signal(SignalKind::interrupt())?;
@@ -101,6 +125,13 @@ async fn main() -> anyhow::Result<()> {
                         eprint!("{CLEAR_LINE}{PROGRESS_CLEAR}");
                     }
 
+                    // Anything that isn't more streamed text starts on its own line.
+                    let streaming = matches!(event, Event::TextDelta(_) | Event::ThinkingDelta(_));
+                    if mid_line && !streaming {
+                        eprintln!();
+                        mid_line = false;
+                    }
+
                     match event {
                         Event::RequestStarted => {
                             println!();
@@ -109,7 +140,18 @@ async fn main() -> anyhow::Result<()> {
                                 eprint!("{PROGRESS_BUSY}");
                             }
                         }
-                        Event::Text(text) => println!("{text}\n"),
+                        Event::TextDelta(text) => {
+                            print!("{text}");
+                            std::io::stdout().flush()?;
+                            mid_line = !text.ends_with('\n');
+                        }
+                        // mid_line was already cleared above.
+                        Event::TextEnd => println!(),
+                        Event::ThinkingDelta(text) => {
+                            eprint!("{DIM}{text}{RESET}");
+                            mid_line = !text.ends_with('\n');
+                        }
+                        Event::ThinkingEnd => {}
                         Event::ToolCall { name, input } => {
                             eprintln!("{DIM}→ {name}({}){RESET}", one_line(&input.to_string(), 120));
                         }
@@ -120,16 +162,23 @@ async fn main() -> anyhow::Result<()> {
                                 eprintln!("{DIM}  ✓ {name}: {} lines{RESET}", output.content.lines().count());
                             }
                         }
-                        Event::Usage { usage: u, latency } => eprintln!(
-                            "{DIM}[tokens: {} in / {} cache write / {} cache read / {} out | {:.1}s]{RESET}",
-                            u.input_tokens,
-                            u.cache_creation_input_tokens.unwrap_or(0),
-                            u.cache_read_input_tokens.unwrap_or(0),
-                            u.output_tokens,
-                            latency.as_secs_f64()
-                        ),
+                        Event::Usage { usage: u, first_token, latency } => {
+                            let first = match first_token {
+                                Some(t) => format!("{:.1}s to first token, ", t.as_secs_f64()),
+                                None => String::new(),
+                            };
+                            eprintln!(
+                                "{DIM}[tokens: {} in / {} cache write / {} cache read / {} out | {first}{:.1}s total]{RESET}",
+                                u.input_tokens,
+                                u.cache_creation_input_tokens.unwrap_or(0),
+                                u.cache_read_input_tokens.unwrap_or(0),
+                                u.output_tokens,
+                                latency.as_secs_f64()
+                            );
+                        }
                         Event::Stopped(reason) => eprintln!("[stopped: {reason:?}]"),
                         Event::Interrupted => eprintln!("{DIM}[interrupted]{RESET}"),
+                        Event::Steered(n) => eprintln!("{DIM}[{n} new message(s) added to this turn]{RESET}"),
                         Event::Error(e) => eprintln!("error: {e}"),
                         Event::TurnEnded => {
                             println!();

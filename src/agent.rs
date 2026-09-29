@@ -343,10 +343,14 @@ impl Agent {
                                         let _ = cancel.send(());
                                         run.await
                                     }
-                                    // Let it finish: stopping a send or a write halfway
-                                    // could leave it half done.
+                                    // A command can be stopped and rerun if still
+                                    // needed, so stop bash; let anything else (a send,
+                                    // a write) finish rather than leave it half done.
                                     Arrival::Message => {
                                         steered = true;
+                                        if name == "bash" {
+                                            let _ = cancel.send(());
+                                        }
                                         run.await
                                     }
                                 },
